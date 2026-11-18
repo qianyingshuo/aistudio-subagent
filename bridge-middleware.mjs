@@ -396,6 +396,7 @@ export class PortableBridgeQueue {
     const record = this.coroutineState.calls.find((c) => c.taskId === task.id);
     if (!record) return;
     record.status = task.status;
+    if (task.progress) record.progress = task.progress;
     if (typeof task.tabId === 'number') record.tabId = task.tabId;
     if (task.completedAt) record.completedAt = task.completedAt;
     if (task.result) {
@@ -537,7 +538,7 @@ async function readJsonBody(req) {
   return await new Promise((resolve) => {
     const chunks = [];
     let totalBytes = 0;
-    const limit = 4 * 1024 * 1024;
+    const limit = 16 * 1024 * 1024;
     req.on('data', (chunk) => {
       totalBytes += chunk.length;
       if (totalBytes <= limit) {
@@ -559,11 +560,47 @@ async function readJsonBody(req) {
   });
 }
 
+function sanitizeTaskIdForFile(taskId) {
+  return String(taskId || 'unknown').replace(/[^a-zA-Z0-9._-]/g, '_');
+}
+
 export function createBridgeRouter(options = {}) {
   const queue =
     options.queue || new PortableBridgeQueue(options.stateFilePath);
+  const resultsDir = path.resolve(path.dirname(queue.stateFilePath), '.subagent-results');
   const sseClients = new Set();
   const debugLogs = [];
+
+  function persistResultToDisk(taskId, resultStr) {
+    if (!taskId || typeof resultStr !== 'string') return;
+    try {
+      fs.mkdirSync(resultsDir, { recursive: true });
+      fs.writeFileSync(
+        path.join(resultsDir, `${sanitizeTaskIdForFile(taskId)}.txt`),
+        resultStr,
+        'utf-8'
+      );
+    } catch {
+      // ignore
+    }
+  }
+
+  function loadResultFromDisk(taskId) {
+    try {
+      const safeId = sanitizeTaskIdForFile(taskId);
+      const mdPath = path.join(resultsDir, `${safeId}.md`);
+      if (fs.existsSync(mdPath)) {
+        return fs.readFileSync(mdPath, 'utf-8');
+      }
+      const txtPath = path.join(resultsDir, `${safeId}.txt`);
+      if (fs.existsSync(txtPath)) {
+        return fs.readFileSync(txtPath, 'utf-8');
+      }
+    } catch {
+      // ignore
+    }
+    return null;
+  }
 
   function pushLog(event, detail) {
     debugLogs.push({ ts: new Date().toISOString(), event, detail });
@@ -833,11 +870,20 @@ export function createBridgeRouter(options = {}) {
       return;
     }
 
-    // 3. 单任务查询
+    // 3. 单任务查询（内存未命中时回退读取磁盘 .subagent-results）
     if (method === 'GET' && pathname.startsWith('/api/__bridge/task/')) {
       const taskId = decodeURIComponent(pathname.slice('/api/__bridge/task/'.length));
       const task = queue.getTask(taskId);
       if (!task) {
+        const diskText = loadResultFromDisk(taskId);
+        if (diskText !== null) {
+          sendJson(res, 200, {
+            ok: true,
+            fromDisk: true,
+            task: { id: taskId, status: 'completed', result: diskText },
+          });
+          return;
+        }
         sendJson(res, 404, { error: `未找到任务 ${taskId}` });
         return;
       }
@@ -899,14 +945,16 @@ export function createBridgeRouter(options = {}) {
         sendJson(res, 400, { error: '缺少 taskId' });
         return;
       }
+      const resultStr = typeof result === 'string' ? result : JSON.stringify(result);
+      persistResultToDisk(taskId, resultStr);
       const updated = queue.completeTask({
         taskId,
-        result: typeof result === 'string' ? result : JSON.stringify(result),
+        result: resultStr,
         status: status === 'error' ? 'error' : 'completed',
         source,
         tabId: typeof tabId === 'number' ? tabId : undefined,
       });
-      pushLog('callback', `id=${taskId} status=${status} tabId=${tabId ?? '-'}`);
+      pushLog('callback', `id=${taskId} status=${status} tabId=${tabId ?? '-'} chars=${resultStr.length}`);
       if (!updated) {
         sendJson(res, 404, { error: `未找到任务 ${taskId}` });
         return;
